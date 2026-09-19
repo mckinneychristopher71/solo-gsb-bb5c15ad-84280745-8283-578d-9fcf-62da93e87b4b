@@ -1327,7 +1327,11 @@ exists in the supplied calendar.
 `DATE-TIME` values are supported; `RELATED` other than `START`/`END`, or
 `RELATED` on an absolute trigger), exactly one of `REPEAT`/`DURATION`
 present, a negative `REPEAT`, a non-positive alarm `DURATION`, a fan-out
-beyond 1000 reminders, or an unknown `TZID` on an absolute trigger. All
+beyond 1000 reminders, an unknown `TZID` on an absolute trigger, a
+`TRIGGER`/`DURATION` value too large to represent, an absolute trigger
+whose UTC instant falls outside the representable datetime range (years
+1–9999), or an alarm reach so extreme that even the clamped instance
+window cannot be expanded safely. All
 `VALARM`s are validated eagerly, so an unsupported alarm yields `422`
 even when its trigger lies outside the window; calendar-level failures
 (unparsable ICS, bad window, invalid recurrence) reuse the `/expand`
@@ -1454,6 +1458,18 @@ types) are normal request-validation `422`s.
   Absolute `DATE-TIME` triggers contribute no padding: they fire for the
   instances overlapping the query window and are filtered by trigger time
   only. The per-`UID` expansion cap applies to the padded window.
+- **Range safety**: trigger offsets, `REPEAT`/`DURATION` fan-outs and the
+  back-projection padding are computed in exact integer microseconds, so
+  extreme values (e.g. `TRIGGER:-P9999999D`, `REPEAT:999` with
+  `DURATION:P9999999D`) never overflow date arithmetic. A trigger instant
+  outside the representable datetime range (before year 1 or after year
+  9999) can never land inside a query window and is skipped — per
+  `REPEAT` step, so one step may leave the range and a later one come
+  back into it. An alarm whose triggers could never reach the window at
+  all adds no expansion padding; otherwise the back-projected instance
+  window is clamped to the representable range (leaving the kernel room
+  for its own duration padding and timezone conversion). Input that
+  cannot be represented or safely expanded at all fails with `422`.
 - **Triggers**: a duration-valued `TRIGGER` is added to the instance's
   DTSTART (default / `RELATED=START`) or DTEND (`RELATED=END`); signed
   durations point before (negative) or after (positive) the anchor. An

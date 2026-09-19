@@ -715,3 +715,214 @@ def test_calendar_level_failures_still_return_422():
     resp = alarms(ics, "2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z")
     assert resp.status_code == 422
     assert "window_start" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Extreme ranges: triggers and fan-outs beyond the representable datetime
+# range (years 1-9999) must never overflow into a 500. Out-of-window
+# triggers are safely skipped; input that cannot be represented or expanded
+# at all is a 422; ordinary alarms are unaffected.
+# ---------------------------------------------------------------------------
+
+def test_extreme_negative_trigger_is_safely_skipped():
+    # The reminder would fire ~27 000 years before the event: outside every
+    # representable window, so it is skipped instead of overflowing.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+    assert resp.json()["alarms"] == []
+
+
+def test_extreme_positive_trigger_is_safely_skipped():
+    # The reminder would fire ~27 000 years after the event (past year 9999).
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_end_anchored_trigger_is_safely_skipped():
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER;RELATED=END:-P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_trigger_on_recurring_series_is_safely_skipped():
+    # The clamped instance window still expands the bounded series; every
+    # reminder lands ~27 000 years before its instance and is skipped.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        alarm("TRIGGER:-P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_repeat_steps_back_into_representable_range():
+    # Fires at anchor - 9999999d (before year 1: skipped), exactly at the
+    # anchor (inside the window), and at anchor + 9999999d (past year 9999:
+    # skipped) — each REPEAT step is judged on its own.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-P9999999D", "REPEAT:2", "DURATION:P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert rows(resp) == [("2026-01-05T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_huge_repeat_fanout_does_not_overflow():
+    # 999 repetitions spaced ~27 000 years apart: the first reminder lands
+    # in the window, every later one is past year 9999 and is skipped.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-PT15M", "REPEAT:999", "DURATION:P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-05T08:45:00Z",
+    ]
+
+
+def test_repeat_past_datetime_max_is_clipped():
+    # The instance and the first trigger sit at the very edge of the
+    # representable range; both repetitions fall past year 9999.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:99991231T090000Z",
+        "DTEND:99991231T100000Z",
+        alarm(
+            "TRIGGER;VALUE=DATE-TIME:99991231T230000Z",
+            "REPEAT:2",
+            "DURATION:PT1H",
+            *DISPLAY,
+        ),
+    ))
+    resp = alarms(
+        ics,
+        window_start="9999-12-31T00:00:00Z",
+        window_end="9999-12-31T23:59:59Z",
+    )
+    assert resp.status_code == 200
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "9999-12-31T23:00:00Z",
+    ]
+
+
+def test_large_but_representable_reach_still_fires():
+    # 7305 days = 20 years (5 leap days): the reminder of an event 20 years
+    # past the window lands exactly on 2026-01-05T09:00Z, inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20460105T090000Z",
+        "DTEND:20460105T100000Z",
+        alarm("TRIGGER:-P7305D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert rows(resp) == [("2026-01-05T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_extreme_trigger_does_not_poison_other_events():
+    # One event's unrepresentable trigger is skipped while another event's
+    # ordinary reminder is still returned.
+    ics = cal(
+        event(
+            "UID:normal",
+            "DTSTART:20260105T090000Z",
+            "DTEND:20260105T100000Z",
+            alarm("TRIGGER:-PT15M", *DISPLAY),
+        ),
+        event(
+            "UID:extreme",
+            "DTSTART:20260105T090000Z",
+            "DTEND:20260105T100000Z",
+            alarm("TRIGGER:-P9999999D", *DISPLAY),
+        ),
+    )
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert rows(resp) == [("2026-01-05T08:45:00Z", "normal", None, "Reminder")]
+
+
+def test_unbounded_series_with_unreachable_trigger_is_safely_skipped():
+    # An unbounded series whose alarm can never fire inside the window is
+    # not expanded across the whole representable range either: the answer
+    # is simply "no reminders".
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=DAILY",
+        alarm("TRIGGER:-P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+def test_unbounded_series_with_extreme_reach_hits_expansion_cap():
+    # This alarm fires 9999999 days before each instance and once more
+    # 9999999 days later, so instances up to year 9999 could fire inside
+    # the window; expanding the clamped window trips the per-UID
+    # occurrence cap — the same safety limit /expand applies to any
+    # padded window.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=MONTHLY",
+        alarm("TRIGGER:-P9999999D", "REPEAT:1", "DURATION:P9999999D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 422
+    assert "10000" in resp.json()["detail"]
+
+
+def test_unrepresentable_trigger_duration_returns_422():
+    detail = post_422(alarm("TRIGGER:P1000000000D", *DISPLAY))
+    assert "duration" in detail.lower()
+
+
+def test_unrepresentable_repeat_duration_returns_422():
+    detail = post_422(
+        alarm("TRIGGER:-PT15M", "REPEAT:2", "DURATION:P1000000000D", *DISPLAY)
+    )
+    assert "duration" in detail.lower()
+
+
+def test_absolute_trigger_beyond_datetime_max_returns_422():
+    # 23:00 at UTC-11 on the last representable day is 10:00 UTC on
+    # 10000-01-01: the UTC instant cannot be represented.
+    detail = post_422(
+        alarm(
+            "TRIGGER;VALUE=DATE-TIME;TZID=Pacific/Midway:99991231T230000",
+            *DISPLAY,
+        )
+    )
+    assert "representable" in detail
