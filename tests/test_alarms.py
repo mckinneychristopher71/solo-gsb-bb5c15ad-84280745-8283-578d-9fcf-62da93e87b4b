@@ -715,3 +715,209 @@ def test_calendar_level_failures_still_return_422():
     resp = alarms(ics, "2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z")
     assert resp.status_code == 422
     assert "window_start" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Boundary safety: extreme relative TRIGGER and REPEAT+DURATION values
+#
+# Adding an authored duration may cross Python's datetime bounds (years
+# 1..9999) in three places: eager validation, the back-projected instance
+# window and the per-instance firing fan. None of them may surface as a 500:
+# a trigger that cannot hit the query window is skipped, an input that
+# cannot be represented or expanded is a 422, and ordinary relative/absolute
+# alarms plus the half-open [start, end) semantics stay unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_extreme_negative_trigger_beyond_representable_range_is_skipped():
+    # Event in year 1 with a -100 000 000-day trigger: the firing lives
+    # before year 1 and cannot reach the 2026 window — 200, no reminders.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:00010101T000000Z",
+        "DTEND:00010101T010000Z",
+        alarm("TRIGGER:-P100000000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_positive_trigger_beyond_representable_range_is_skipped():
+    # Event in year 9998 with a +100 000 000-day trigger: the firing lives
+    # past year 9999 — safe skip, never a 500.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:99980101T000000Z",
+        "DTEND:99980101T010000Z",
+        alarm("TRIGGER:P100000000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_negative_trigger_padding_saturates_without_500():
+    # A modern event with a gigantic negative TRIGGER back-projects the
+    # instance window past year 1 (pad_after). The bound saturates and the
+    # single instance still materializes; the firing itself is in range.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-P100000000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_positive_trigger_padding_saturates_without_500():
+    # Mirror case: a gigantic positive TRIGGER pushes the lower instance
+    # bound below year 1 (pad_before).
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:P100000000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_repeat_duration_fanout_beyond_timedelta_range_is_422():
+    # REPEAT * DURATION overflows Python's timedelta range; the fan-out
+    # cannot be expanded at all, so eager validation returns 422.
+    detail = post_422(
+        alarm(
+            "TRIGGER:-PT1H",
+            "REPEAT:999",
+            "DURATION:PT99999999H",
+            *DISPLAY,
+        )
+    )
+    assert "REPEAT*DURATION" in detail
+
+
+def test_large_but_representable_fanout_is_safely_skipped():
+    # 2 * ~416 666 days is still a representable timedelta but pushes the
+    # padded instance window past both datetime bounds; only the initial
+    # firing (08:00) is anywhere near the window, so it alone is returned.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-PT1H", "REPEAT:2", "DURATION:PT99999999H", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-05T08:00:00Z",
+    ]
+
+
+def test_unrepresentable_fanout_is_rejected_even_when_window_is_far_away():
+    # Eager validation applies to every VALARM regardless of where the
+    # window sits.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm(
+            "TRIGGER:-PT1H",
+            "REPEAT:999",
+            "DURATION:PT99999999H",
+            *DISPLAY,
+        ),
+    ))
+    resp = alarms(
+        ics,
+        window_start="2030-01-01T00:00:00Z",
+        window_end="2030-02-01T00:00:00Z",
+    )
+    assert resp.status_code == 422
+    assert "REPEAT*DURATION" in resp.json()["detail"]
+
+
+def test_out_of_range_firing_beside_in_range_firing_is_skipped():
+    # A year-1 event whose first firing precedes year 1 with a few in-range
+    # repeats: out-of-range firings are skipped, in-range ones emitted, with
+    # no 500.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:00010103T000000Z",
+        "DTEND:00010103T010000Z",
+        alarm(
+            "TRIGGER:-P5D",
+            "REPEAT:6",
+            "DURATION:P1D",
+            *DISPLAY,
+        ),  # days -2, -1, then 0001-01-01 .. 0001-01-04
+    ))
+    resp = alarms(
+        ics,
+        window_start="0001-01-01T00:00:00Z",
+        window_end="0002-01-01T00:00:00Z",
+    )
+    assert resp.status_code == 200, resp.text
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "0001-01-01T00:00:00Z",
+        "0001-01-02T00:00:00Z",
+        "0001-01-03T00:00:00Z",
+        "0001-01-04T00:00:00Z",
+    ]
+
+
+def test_extreme_padding_with_tz_aware_recurring_master_does_not_500():
+    # The padded instance window saturates at the datetime bounds; clamping
+    # it back into the master's local zone must not raise in the recurrence
+    # kernel either.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART;TZID=America/New_York:20260105T090000",
+        "DTEND;TZID=America/New_York:20260105T100000",
+        "RRULE:FREQ=DAILY;COUNT=3",
+        alarm("TRIGGER:-P100000000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["count"] == 0
+
+
+def test_extreme_reachable_relative_trigger_still_found():
+    # Saturation must be exact: a large authored reach whose firing lands in
+    # the window is still found (event 100 000 days before 2026-01-15 with a
+    # +100 000-day follow-up).
+    event_start = "17520401T000000Z"  # 2026-01-15 minus 100 000 days
+    ics = cal(event(
+        "UID:evt-1",
+        f"DTSTART:{event_start}",
+        "DTEND:17520401T010000Z",
+        alarm("TRIGGER:P100000D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.status_code == 200, resp.text
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-15T00:00:00Z",
+    ]
+
+
+def test_boundary_handling_keeps_half_open_window_semantics():
+    # The boundary refactor must not move the half-open edges: a firing at
+    # window_start is included, one at window_end excluded.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:PT0S", "REPEAT:2", "DURATION:PT1H", *DISPLAY),
+    ))
+    resp = alarms(
+        ics,
+        window_start="2026-01-05T09:00:00Z",
+        window_end="2026-01-05T11:00:00Z",
+    )
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-05T09:00:00Z",
+        "2026-01-05T10:00:00Z",
+    ]

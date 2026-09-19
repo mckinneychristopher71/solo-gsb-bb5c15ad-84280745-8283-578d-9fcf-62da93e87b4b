@@ -715,6 +715,13 @@ Alarm semantics:
   nobody). A cancelled occurrence produces no reminders.
 - The window is half-open: a trigger exactly at `window_start` is included,
   one exactly at `window_end` is excluded.
+- A relative `TRIGGER` or `REPEAT`/`DURATION` span may be far larger than
+  the years 1..9999 Python datetimes can represent. Such spans never cause
+  a 500: the instance window is widened with arbitrary-precision tick
+  arithmetic and saturated at the datetime limits, and individual firings
+  that fall outside the representable range and cannot hit the query
+  window are skipped. A `REPEAT*DURATION` fan-out that itself cannot be
+  represented as a duration is rejected with `422`.
 
 Each reminder carries `uid`, `recurrence_id` (UTC, `null` for
 non-recurring events), `summary` (of the instance it belongs to), `trigger`
@@ -1327,7 +1334,8 @@ exists in the supplied calendar.
 `DATE-TIME` values are supported; `RELATED` other than `START`/`END`, or
 `RELATED` on an absolute trigger), exactly one of `REPEAT`/`DURATION`
 present, a negative `REPEAT`, a non-positive alarm `DURATION`, a fan-out
-beyond 1000 reminders, or an unknown `TZID` on an absolute trigger. All
+beyond 1000 reminders, a `REPEAT*DURATION` fan-out that cannot be
+represented as a duration, or an unknown `TZID` on an absolute trigger. All
 `VALARM`s are validated eagerly, so an unsupported alarm yields `422`
 even when its trigger lies outside the window; calendar-level failures
 (unparsable ICS, bad window, invalid recurrence) reuse the `/expand`

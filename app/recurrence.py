@@ -512,12 +512,7 @@ def _expand_master(
         for value in _datetimes(prop, start):
             rset.exdate(value)
 
-    if start.tzinfo is None:  # floating time: interpreted as UTC
-        after = (window_start - duration).replace(tzinfo=None)
-        before = window_end.replace(tzinfo=None)
-    else:
-        after = (window_start - duration).astimezone(start.tzinfo)
-        before = window_end.astimezone(start.tzinfo)
+    after, before = _frame_bounds(start, duration, window_start, window_end)
 
     try:
         occurrences: list[dt.datetime] = []
@@ -557,14 +552,74 @@ def _frame_bounds(
     window_start: dt.datetime,
     window_end: dt.datetime,
 ) -> tuple:
-    """Duration-padded query bounds expressed in the master's local frame."""
+    """Duration-padded query bounds expressed in the master's local frame.
+
+    Padded bounds may reach the edges of (or beyond) the representable
+    datetime range — extreme query windows, or windows back-projected by
+    large authored durations (e.g. the /alarms padding). Both the datetime
+    subtraction and the projection into a non-UTC zone can overflow there,
+    so the local frame is saturated at ``datetime.min``/``max``: no
+    occurrence that can matter lies beyond that frame.
+    """
     if start.tzinfo is None:  # floating time: interpreted as UTC
-        return (window_start - duration).replace(tzinfo=None), window_end.replace(
-            tzinfo=None
-        )
-    return (window_start - duration).astimezone(start.tzinfo), window_end.astimezone(
-        start.tzinfo
-    )
+        after = _saturate_naive(_shift_datetime(window_start, -duration))
+        before = _saturate_naive(window_end)
+    else:
+        after = _safe_astimezone(_shift_datetime(window_start, -duration), start.tzinfo)
+        before = _safe_astimezone(window_end, start.tzinfo)
+    return after, before
+
+
+def _shift_datetime(value: dt.datetime, delta: dt.timedelta) -> dt.datetime:
+    """``value + delta`` that saturates instead of raising at year 1/9999.
+
+    The returned bound keeps ``value``'s awareness (UTC throughout the
+    kernel); callers project it into another zone afterwards.
+    """
+    bound_low = dt.datetime.min
+    bound_high = dt.datetime.max
+    if value.tzinfo is not None:
+        bound_low = bound_low.replace(tzinfo=value.tzinfo)
+        bound_high = bound_high.replace(tzinfo=value.tzinfo)
+    try:
+        shifted = value + delta
+    except OverflowError:
+        return bound_high if delta > dt.timedelta(0) else bound_low
+    if shifted < bound_low:
+        return bound_low
+    if shifted > bound_high:
+        return bound_high
+    return shifted
+
+
+def _safe_astimezone(value: dt.datetime, tzinfo) -> dt.datetime:
+    """astimezone that saturates instead of overflowing at year 1/9999.
+
+    ``value`` is UTC-aware (the kernel normalizes everything). An overflow
+    means the projection leaves the representable range, so the local frame
+    is saturated at the corresponding aware bound: no occurrence that can
+    matter lies beyond it.
+    """
+    try:
+        return value.astimezone(tzinfo)
+    except OverflowError:
+        if value <= dt.datetime.min.replace(tzinfo=UTC):
+            return dt.datetime.min.replace(tzinfo=tzinfo)
+        return dt.datetime.max.replace(tzinfo=tzinfo)
+
+
+def _saturate_naive(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    return _saturate(value)
+
+
+def _saturate(value: dt.datetime) -> dt.datetime:
+    if value < dt.datetime.min.replace(tzinfo=value.tzinfo):
+        return dt.datetime.min.replace(tzinfo=value.tzinfo)
+    if value > dt.datetime.max.replace(tzinfo=value.tzinfo):
+        return dt.datetime.max.replace(tzinfo=value.tzinfo)
+    return value
 
 
 def _hits_in_frame(rset, after, before) -> set[dt.datetime]:

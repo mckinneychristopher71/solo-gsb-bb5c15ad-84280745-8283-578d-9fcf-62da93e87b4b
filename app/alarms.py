@@ -31,6 +31,25 @@ window and are filtered by their trigger time only.
 
 Anything invalid or unsupported raises :class:`AlarmError`, which the HTTP
 layer maps to 422.
+
+Boundary policy. Python datetimes only span years 1..9999, but an authored
+relative TRIGGER or REPEAT/DURATION span may reach far beyond that. The three
+places that add such spans share one strategy:
+
+* **validation** — a REPEAT/DURATION pair whose total fan-out cannot even be
+  represented as a duration (it overflows Python's timedelta range) is
+  rejected eagerly with :class:`AlarmError` (422);
+* **window padding** — the back-projected instance window is shifted in an
+  unbounded integer "tick" domain (microseconds, arbitrary precision) and
+  saturated at the datetime limits, which is exact because no instance that
+  could fire inside the query window lies beyond the unreachable bound;
+* **per-instance fan** — each firing is likewise located by tick arithmetic;
+  firings outside the representable range that cannot hit the query window
+  are safely skipped, and only in-window firings (representable by
+  construction) become :class:`Reminder` objects.
+
+Ordinary relative/absolute alarms and the half-open ``[window_start,
+window_end)`` semantics are unaffected.
 """
 
 from __future__ import annotations
@@ -54,6 +73,65 @@ UTC = dt.timezone.utc
 # Upper bound on reminders one alarm may fan out to (1 initial trigger plus
 # REPEAT repeats), keeping an abusive REPEAT from flooding a response.
 MAX_REMINDERS_PER_ALARM = 1_000
+
+# Python datetimes only cover years 1..9999. Every boundary-sensitive
+# computation in this module (window padding, per-instance firing math) is
+# expressed in this integer "tick" domain — microseconds since the UTC
+# epoch, unconstrained in width — so adding or multiplying authored
+# durations can never raise OverflowError. Ticks are converted back to
+# datetimes only for values known to fall inside the query window, which
+# are representable by construction.
+_US_PER_SECOND = 1_000_000
+_US_PER_DAY = 86_400 * _US_PER_SECOND
+
+_EPOCH = dt.datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _ticks(value: dt.datetime) -> int:
+    """Microseconds since the UTC epoch (arbitrary precision)."""
+    delta = value - _EPOCH
+    return (
+        delta.days * _US_PER_DAY
+        + delta.seconds * _US_PER_SECOND
+        + delta.microseconds
+    )
+
+
+_DATETIME_MIN_TICKS = _ticks(dt.datetime.min.replace(tzinfo=UTC))
+_DATETIME_MAX_TICKS = _ticks(dt.datetime.max.replace(tzinfo=UTC))
+
+
+def _delta_ticks(value: dt.timedelta) -> int:
+    """A duration as microseconds (arbitrary precision)."""
+    return (
+        value.days * _US_PER_DAY
+        + value.seconds * _US_PER_SECOND
+        + value.microseconds
+    )
+
+
+def _from_ticks(ticks: int) -> dt.datetime:
+    """Rebuild an aware UTC datetime from in-range ticks."""
+    days, remainder = divmod(ticks - _DATETIME_MIN_TICKS, _US_PER_DAY)
+    return dt.datetime.min.replace(tzinfo=UTC) + dt.timedelta(
+        days=days, microseconds=remainder
+    )
+
+
+def _shift_clamped(value: dt.datetime, delta_ticks: int) -> dt.datetime:
+    """Shift ``value`` by signed microseconds, saturating at the bounds.
+
+    Used for the padded instance window: padding that would push the bound
+    past year 1/9999 saturates instead of raising. Saturation is exact here
+    because no instance that could fire inside the query window lives
+    beyond the (unreachable) true bound.
+    """
+    total = _ticks(value) + delta_ticks
+    if total <= _DATETIME_MIN_TICKS:
+        return dt.datetime.min.replace(tzinfo=UTC)
+    if total >= _DATETIME_MAX_TICKS:
+        return dt.datetime.max.replace(tzinfo=UTC)
+    return _from_ticks(total)
 
 
 class AlarmError(Exception):
@@ -107,8 +185,8 @@ def expand_alarms(
     reminders: list[Reminder] = []
     for uid, events in group_events_by_uid(calendar).items():
         pad_before, pad_after = _expansion_padding(events, specs)
-        inst_start = window_start - pad_before
-        inst_end = window_end + pad_after
+        inst_start = _shift_clamped(window_start, -pad_before)
+        inst_end = _shift_clamped(window_end, pad_after)
         for slot in compute_candidates(uid, events, inst_start, inst_end):
             instance = slot.instance
             if instance is None or not _overlaps(
@@ -143,9 +221,9 @@ def expand_alarms(
 
 def _expansion_padding(
     events: list, specs: dict[int, _AlarmSpec]
-) -> tuple[dt.timedelta, dt.timedelta]:
+) -> tuple[int, int]:
     """How far one UID group's instance expansion must reach beyond the
-    query window for its reminders to be found.
+    query window for its reminders to be found, as signed microseconds.
 
     A duration TRIGGER fires at ``anchor + delta`` (anchor = DTSTART, or
     DTEND for ``RELATED=END``), and REPEAT/DURATION extends the fan-out to
@@ -161,6 +239,11 @@ def _expansion_padding(
     derived from the authored TRIGGER/REPEAT/DURATION values, never a fixed
     number of days. Absolute DATE-TIME triggers do not move with the
     instance, so they contribute no padding.
+
+    Reaches are accumulated in the unbounded integer tick domain, so even
+    an extreme authored span (e.g. REPEAT*DURATION beyond Python's
+    timedelta range) cannot overflow here; the caller saturates the padded
+    window to the representable datetime range.
     """
     masters = [e for e in events if "RECURRENCE-ID" not in e]
     master = masters[0] if masters else None
@@ -169,7 +252,7 @@ def _expansion_padding(
         start, end, _ = _event_times(master)
         master_duration = end - start
 
-    pad_before = pad_after = dt.timedelta(0)
+    pad_before = pad_after = 0
     for event in events:
         alarms = [c for c in event.subcomponents if c.name == "VALARM"]
         if not alarms:
@@ -185,10 +268,10 @@ def _expansion_padding(
             spec = specs[id(alarm)]
             if isinstance(spec.trigger, dt.datetime):
                 continue  # absolute trigger: independent of the instance time
-            offset = spec.trigger
-            if spec.related_end:
-                offset = duration + offset
-            fanout = spec.repeat * spec.spacing
+            offset = (
+                _delta_ticks(duration) if spec.related_end else 0
+            ) + _delta_ticks(spec.trigger)
+            fanout = spec.repeat * _delta_ticks(spec.spacing)
             pad_before = max(pad_before, offset + fanout)
             pad_after = max(pad_after, -offset)
     return pad_before, pad_after
@@ -217,9 +300,12 @@ def _parse_alarm(alarm) -> _AlarmSpec:
     if trigger_prop is None:
         raise AlarmError("VALARM is missing the required TRIGGER property")
     params = trigger_prop.params or {}
+    try:
+        raw = trigger_prop.dt
+    except (OverflowError, ValueError) as exc:
+        raise AlarmError(f"VALARM TRIGGER duration cannot be represented: {exc}") from exc
 
     value_type = str(params.get("VALUE", "")).upper()
-    raw = trigger_prop.dt
     related = str(params.get("RELATED", "")).upper()
 
     if isinstance(raw, dt.timedelta):
@@ -299,6 +385,16 @@ def _parse_repeat(alarm) -> tuple[int, dt.timedelta]:
         raise AlarmError(
             f"VALARM fans out to more than {MAX_REMINDERS_PER_ALARM} reminders"
         )
+    try:
+        # The full fan-out must itself be expressible as a duration; a
+        # REPEAT/DURATION pair whose span leaves the representable timedelta
+        # range cannot be expanded and is rejected up front (422) rather
+        # than overflowing later.
+        repeat * spacing
+    except OverflowError as exc:
+        raise AlarmError(
+            "VALARM REPEAT*DURATION fan-out cannot be represented as a duration"
+        ) from exc
     return repeat, spacing
 
 
@@ -313,24 +409,58 @@ def _materialize(
     window_start: dt.datetime,
     window_end: dt.datetime,
 ) -> list[Reminder]:
+    # The firing schedule is computed entirely in the unbounded integer
+    # tick domain. The first firing or a later one may lie outside the
+    # representable datetime range (an extreme relative TRIGGER on an
+    # instance near year 1/9999, or a late REPEAT step); such firings are
+    # safely skipped when they cannot reach the window, instead of being
+    # built as datetimes and raising. Firings that fall in the window are
+    # representable by construction, so the half-open comparison semantics
+    # are unchanged.
     if isinstance(spec.trigger, dt.datetime):
-        first = spec.trigger
+        first_ticks = _ticks(spec.trigger)
     else:
         anchor = instance.end if spec.related_end else instance.start
-        first = anchor + spec.trigger
+        first_ticks = _ticks(anchor) + _delta_ticks(spec.trigger)
+    spacing_ticks = _delta_ticks(spec.spacing)
+
+    lo = _ticks(window_start)
+    hi = _ticks(window_end)
+    count = spec.repeat + 1
+
+    # Restrict the loop to the firing indices whose instant is inside the
+    # window. Spacing is positive whenever repeat > 0, so the candidate
+    # indices form one contiguous interval; unrepresentable firings below
+    # the window are skipped by the interval itself.
+    if spacing_ticks > 0:
+        needed = lo - first_ticks  # smallest k with first + k*s >= lo
+        start_index = (
+            (needed + spacing_ticks - 1) // spacing_ticks if needed > 0 else 0
+        )
+        too_far = hi - first_ticks  # exclusive bound: first + k*s < hi
+        end_index = (
+            min(count, (too_far - 1) // spacing_ticks + 1) if too_far > 0 else 0
+        )
+    else:
+        start_index = 0
+        end_index = count if lo <= first_ticks < hi else 0
 
     reminders = []
-    current = first
-    for _ in range(spec.repeat + 1):
-        if window_start <= current < window_end:
-            reminders.append(
-                Reminder(
-                    uid=instance.uid,
-                    recurrence_id=instance.recurrence_id,
-                    summary=instance.summary,
-                    trigger=current,
-                    description=spec.description,
-                )
+    for index in range(start_index, end_index):
+        current_ticks = first_ticks + index * spacing_ticks
+        if current_ticks < _DATETIME_MIN_TICKS or current_ticks > _DATETIME_MAX_TICKS:
+            # The padded window can only reach instances represented by
+            # datetimes, and a monotone fan cannot re-enter the window after
+            # leaving the representable range; an unrepresentable firing
+            # therefore cannot hit the query window and is safely skipped.
+            continue
+        reminders.append(
+            Reminder(
+                uid=instance.uid,
+                recurrence_id=instance.recurrence_id,
+                summary=instance.summary,
+                trigger=_from_ticks(current_ticks),
+                description=spec.description,
             )
-        current += spec.spacing
+        )
     return reminders
